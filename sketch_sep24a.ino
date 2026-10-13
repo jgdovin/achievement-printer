@@ -12,14 +12,14 @@
 #include <LittleFS.h>
 
 // Replace with your network credentials
-const char* ssid = "<SSID>";
-const char* password = "<PASSWORD>";
+const char* ssid = "Lan Solo_IOT";
+const char* password = "may092015!";
 
 // === Web Login ===
 // The browser will prompt for these before showing the page or accepting a print.
 // Pick a long password: Basic Auth is only as strong as the password itself.
-const char* WEB_USERNAME = "<USER>";
-const char* WEB_PASSWORD = "<PASSWORD>";
+const char* WEB_USERNAME = "admin";
+const char* WEB_PASSWORD = "admin";
 
 // === Wi-Fi Reconnect ===
 // How long to wait for the initial connection at boot before giving up and
@@ -83,6 +83,36 @@ bool logReady = false;
 String pendingIP = "";
 String pendingLayoutName = "";
 
+// === Image Printing ===
+// The browser does all the image work (resize, grayscale, dither) and uploads
+// raw 1-bit rows, MSB = leftmost pixel, 1 = black. The ESP32 stores them in a
+// temp file and streams them to the printer with GS v 0.
+//   Sharp: 384 px wide (48 bytes/row), printed 1:1.
+//   Fast:  192 px wide (24 bytes/row), printer doubles width and height,
+//          so the same printed area needs 4x less data over the serial link.
+// Both modes allow about 150 mm of printed height.
+const char* IMAGE_PATH = "/pending.bin";
+const int SHARP_WIDTH_BYTES = 48;
+const int FAST_WIDTH_BYTES = 24;
+const int MAX_SHARP_ROWS = 1200;
+const int MAX_FAST_ROWS = 600;
+// Rows per GS v 0 command. Some cheap printers choke on one huge raster
+// command, so the image is sent as a series of bands.
+const int IMAGE_BAND_ROWS = 24;
+
+bool imageRequested = false;
+bool imageFast = true;
+int imageWidthBytes = 0;
+int imageHeight = 0;
+String pendingImageIP = "";
+
+// Upload state, filled in chunk by chunk by handleImageUpload()
+File uploadFile;
+bool uploadOk = false;
+size_t uploadExpected = 0;
+size_t uploadReceived = 0;
+String uploadError = "";
+
 // === Layouts ===
 enum Layout {
   LAYOUT_NOTE,
@@ -101,6 +131,8 @@ bool printRequested = false;
 // === Function Declarations ===
 void handleRoot();
 void handlePrint();
+void handleImageUpload();
+void handleImageDone();
 void handleNotFound();
 bool requireLogin();
 bool requireAdmin();
@@ -116,6 +148,7 @@ void connectWiFi();
 void checkWiFi();
 void initializePrinter();
 void printMessage(const String& text, Layout layout);
+void printImage();
 void printNote(const String& text);
 void printTasks(const String& text);
 void printAchievement(const String& text);
@@ -151,6 +184,9 @@ void setup() {
   // Routes
   server.on("/", HTTP_GET, handleRoot);
   server.on("/print", HTTP_POST, handlePrint);
+  // Image upload: handleImageUpload() receives the body in chunks,
+  // then handleImageDone() sends the response.
+  server.on("/image", HTTP_POST, handleImageDone, handleImageUpload);
   server.on("/log", HTTP_GET, handleLog);
   server.on("/log.txt", HTTP_GET, handleLogDownload);
   server.on("/log/clear", HTTP_POST, handleLogClear);
@@ -172,6 +208,15 @@ void loop() {
     pendingLayoutName = "";
     printRequested = false;
   }
+
+  if (imageRequested) {
+    String desc = String(imageWidthBytes * 8) + "x" + String(imageHeight) + " image";
+    logMessage(pendingImageIP, imageFast ? "image-fast" : "image-sharp", desc);
+    printImage();
+    LittleFS.remove(IMAGE_PATH);
+    pendingImageIP = "";
+    imageRequested = false;
+  }
 }
 
 // === Web Handlers ===
@@ -189,9 +234,11 @@ void handleRoot() {
     html { font-family: Helvetica; text-align: center; background: #f4f4f4; }
     body { margin: 0; padding: 16px; }
     h1 { margin: 8px 0 16px; }
+    h2 { margin: 0 0 8px; }
     textarea { width: 100%; max-width: 420px; box-sizing: border-box; font-size: 18px; padding: 8px; }
     .button { background-color: #4CAF50; border: none; color: white; padding: 16px 40px;
               font-size: 24px; margin: 8px; cursor: pointer; border-radius: 6px; }
+    .button:disabled { background-color: #aaa; cursor: default; }
     .banner { background-color: #dff0d8; color: #3c763d; padding: 12px; margin: 0 auto 16px;
               max-width: 420px; border-radius: 6px; font-size: 18px; }
 
@@ -213,6 +260,16 @@ void handleRoot() {
     .paper .big { font-size: 14px; font-weight: bold; text-align: center; }
     .paper .inv { background: #222; color: #fff; text-align: center; font-weight: bold; }
     .paper .dim { color: #888; }
+
+    /* Image printing */
+    .section { max-width: 420px; margin: 32px auto 0; padding-top: 16px; border-top: 1px solid #ddd; }
+    .opts { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px 16px; margin: 12px 0; font-size: 16px; }
+    #preview { display: none; margin: 8px auto; width: 100%; max-width: 384px; image-rendering: pixelated;
+               background: #fff; border-top: 1px dashed #bbb; border-bottom: 1px dashed #bbb; }
+    #imgInfo { font-size: 13px; color: #666; min-height: 16px; }
+    #imgStatus { font-size: 16px; min-height: 20px; margin-top: 4px; }
+    .small { background: none; border: 1px solid #aaa; border-radius: 6px; padding: 8px 14px;
+             font-size: 14px; cursor: pointer; }
   </style>
 </head>
 <body>
@@ -278,6 +335,157 @@ early tomorrow.</div>
     <p><textarea name="msg" rows="4" maxlength="500" placeholder="Type something to print..." required autofocus></textarea></p>
     <p><button class="button" type="submit">Print</button></p>
   </form>
+
+  <div class="section">
+    <h2>Image</h2>
+    <input type="file" id="imgFile" accept="image/*">
+    <button type="button" class="small" id="testBtn">Test pattern</button>
+    <div class="opts">
+      <label><input type="radio" name="res" value="fast" checked> Fast (chunky)</label>
+      <label><input type="radio" name="res" value="sharp"> Sharp</label>
+    </div>
+    <div class="opts">
+      <label><input type="checkbox" id="dither" checked> Dither (photos)</label>
+      <label>Brightness <input type="range" id="bright" min="-80" max="80" value="0"></label>
+    </div>
+    <canvas id="preview"></canvas>
+    <div id="imgInfo"></div>
+    <button class="button" type="button" id="imgPrint" disabled>Print image</button>
+    <div id="imgStatus"></div>
+  </div>
+
+<script>
+  // Printed height is capped at about 150 mm in both modes
+  const MAX_ROWS = { fast: 600, sharp: 1200 };
+  let source = null;          // an <img> or <canvas> to print from
+  let packed = null;          // 1-bit rows ready to upload
+  let packW = 0, packH = 0, packMode = 'fast';
+
+  const $ = id => document.getElementById(id);
+  const mode = () => document.querySelector('input[name=res]:checked').value;
+
+  function render() {
+    if (!source) return;
+    const m = mode();
+    const W = m === 'fast' ? 192 : 384;
+    const sw = source.naturalWidth || source.width;
+    const sh = source.naturalHeight || source.height;
+
+    // Fit to the paper width, or shrink further if it would be too tall
+    let scale = W / sw;
+    let H = Math.round(sh * scale);
+    if (H > MAX_ROWS[m]) { scale = MAX_ROWS[m] / sh; H = MAX_ROWS[m]; }
+    H = Math.max(1, H);
+    const dw = Math.max(1, Math.round(sw * scale));
+
+    const c = $('preview');
+    c.width = W; c.height = H;
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#fff';             // transparent areas print as white
+    ctx.fillRect(0, 0, W, H);
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(source, Math.round((W - dw) / 2), 0, dw, H);
+
+    const img = ctx.getImageData(0, 0, W, H);
+    const d = img.data;
+    const bright = +$('bright').value;
+    const g = new Float32Array(W * H);
+    for (let i = 0; i < W * H; i++) {
+      g[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2] + bright;
+    }
+
+    // Threshold, optionally with Floyd-Steinberg error diffusion,
+    // packing each row into bytes as we go (MSB = leftmost, 1 = black)
+    const dither = $('dither').checked;
+    const bpr = W / 8;
+    const out = new Uint8Array(bpr * H);
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const i = y * W + x;
+        const old = g[i];
+        const black = old < 128;
+        if (black) out[y * bpr + (x >> 3)] |= 0x80 >> (x & 7);
+        const v = black ? 0 : 255;
+        if (dither) {
+          const e = old - v;
+          if (x + 1 < W) g[i + 1] += e * 7 / 16;
+          if (y + 1 < H) {
+            if (x > 0) g[i + W - 1] += e * 3 / 16;
+            g[i + W] += e * 5 / 16;
+            if (x + 1 < W) g[i + W + 1] += e / 16;
+          }
+        }
+        d[i * 4] = d[i * 4 + 1] = d[i * 4 + 2] = v;
+        d[i * 4 + 3] = 255;
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+    c.style.display = 'block';
+
+    packed = out; packW = W; packH = H; packMode = m;
+    const dots = m === 'fast' ? H * 2 : H;
+    $('imgInfo').textContent = W + '\u00d7' + H + ' px, prints ' + Math.round(dots / 8) +
+      ' mm tall, about ' + Math.ceil(out.length / 960) + ' s to send at 9600 baud';
+    $('imgPrint').disabled = false;
+    $('imgStatus').textContent = '';
+  }
+
+  $('imgFile').addEventListener('change', e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const img = new Image();
+    img.onload = () => { source = img; render(); };
+    img.onerror = () => { $('imgStatus').textContent = 'Could not read that image'; };
+    img.src = URL.createObjectURL(file);
+  });
+
+  // Border, checkers, gradient and text. If Fast mode prints this at half
+  // width on the left side, the printer ignores GS v 0 scaling.
+  $('testBtn').addEventListener('click', () => {
+    const c = document.createElement('canvas');
+    c.width = 384; c.height = 200;
+    const x = c.getContext('2d');
+    x.fillStyle = '#fff'; x.fillRect(0, 0, 384, 200);
+    x.fillStyle = '#000';
+    x.fillRect(0, 0, 384, 4); x.fillRect(0, 196, 384, 4);
+    x.fillRect(0, 0, 4, 200); x.fillRect(380, 0, 4, 200);
+    for (let i = 0; i < 24; i++) {
+      if (i % 2 === 0) x.fillRect(i * 16, 12, 16, 16);
+      else x.fillRect(i * 16, 28, 16, 16);
+    }
+    const grad = x.createLinearGradient(8, 0, 376, 0);
+    grad.addColorStop(0, '#000'); grad.addColorStop(1, '#fff');
+    x.fillStyle = grad; x.fillRect(8, 56, 368, 40);
+    x.fillStyle = '#000'; x.textAlign = 'center';
+    x.font = 'bold 48px sans-serif'; x.fillText('TEST 123', 192, 158);
+    x.font = '16px sans-serif'; x.fillText('border should span the paper', 192, 184);
+    $('imgFile').value = '';
+    source = c; render();
+  });
+
+  document.querySelectorAll('input[name=res]').forEach(r => r.addEventListener('change', render));
+  $('dither').addEventListener('change', render);
+  $('bright').addEventListener('input', render);
+
+  $('imgPrint').addEventListener('click', async () => {
+    if (!packed) return;
+    $('imgPrint').disabled = true;
+    $('imgStatus').textContent = 'Sending...';
+    const fd = new FormData();
+    fd.append('image', new Blob([packed], { type: 'application/octet-stream' }), 'image.bin');
+    try {
+      const r = await fetch('/image?mode=' + packMode + '&w=' + (packW / 8) + '&h=' + packH,
+                            { method: 'POST', body: fd, credentials: 'same-origin' });
+      const text = await r.text();
+      $('imgStatus').textContent = r.ok
+        ? 'Printing! Takes about ' + Math.ceil(packed.length / 960) + ' s.'
+        : 'Error: ' + text;
+    } catch (err) {
+      $('imgStatus').textContent = 'Error: ' + err;
+    }
+    $('imgPrint').disabled = false;
+  });
+</script>
 </body>
 </html>)rawliteral";
 
@@ -328,6 +536,108 @@ void handlePrint() {
   // The query flag tells the form page to show the "Printed!" banner.
   server.sendHeader("Location", "/?printed=1");
   server.send(303);
+}
+
+// Receives the uploaded image in chunks and writes it to IMAGE_PATH.
+// This runs BEFORE handleImageDone(), so it has to check the login itself:
+// otherwise anyone could write data to flash even though the final handler
+// would reject them. The image size comes from the query string
+// (?mode=fast|sharp&w=<bytes per row>&h=<rows>), which is already parsed
+// by the time the body arrives.
+void handleImageUpload() {
+  HTTPUpload& up = server.upload();
+
+  if (up.status == UPLOAD_FILE_START) {
+    uploadOk = false;
+    uploadReceived = 0;
+    uploadError = "";
+
+    if (!server.authenticate(WEB_USERNAME, WEB_PASSWORD)) {
+      uploadError = "Login required";
+      return;
+    }
+    if (!logReady) {
+      uploadError = "Flash storage unavailable";
+      return;
+    }
+    if (imageRequested) {
+      uploadError = "Printer busy, try again";
+      return;
+    }
+
+    String mode = server.arg("mode");
+    int w = server.arg("w").toInt();
+    int h = server.arg("h").toInt();
+    bool fast;
+    if (mode == "fast") {
+      fast = true;
+      if (w != FAST_WIDTH_BYTES || h < 1 || h > MAX_FAST_ROWS) { uploadError = "Bad image size"; return; }
+    } else if (mode == "sharp") {
+      fast = false;
+      if (w != SHARP_WIDTH_BYTES || h < 1 || h > MAX_SHARP_ROWS) { uploadError = "Bad image size"; return; }
+    } else {
+      uploadError = "Bad mode";
+      return;
+    }
+
+    uploadFile = LittleFS.open(IMAGE_PATH, "w");
+    if (!uploadFile) {
+      uploadError = "Could not open temp file";
+      return;
+    }
+    imageFast = fast;
+    imageWidthBytes = w;
+    imageHeight = h;
+    uploadExpected = (size_t)w * h;
+    uploadOk = true;
+
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (!uploadOk) return;
+    uploadReceived += up.currentSize;
+    if (uploadReceived > uploadExpected) {
+      uploadOk = false;
+      uploadError = "Image larger than declared";
+      uploadFile.close();
+      return;
+    }
+    uploadFile.write(up.buf, up.currentSize);
+
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (!uploadOk) return;
+    uploadFile.close();
+    if (uploadReceived != uploadExpected) {
+      uploadOk = false;
+      uploadError = "Image incomplete";
+    }
+
+  } else if (up.status == UPLOAD_FILE_ABORTED) {
+    if (uploadFile) uploadFile.close();
+    uploadOk = false;
+    uploadError = "Upload aborted";
+  }
+}
+
+// Runs after the whole upload has been received.
+void handleImageDone() {
+  if (!requireLogin()) return;
+
+  // Consume the flag so a later request with no file part can't reuse it
+  bool ok = uploadOk;
+  uploadOk = false;
+
+  if (!ok) {
+    server.send(400, "text/plain", uploadError.length() ? uploadError : "No image received");
+    return;
+  }
+
+  pendingImageIP = server.client().remoteIP().toString();
+  imageRequested = true;
+
+  Serial.printf("Image print requested from %s: %dx%d (%s)\n",
+                pendingImageIP.c_str(), imageWidthBytes * 8, imageHeight,
+                imageFast ? "fast" : "sharp");
+
+  server.send(200, "text/plain", "OK");
 }
 
 void handleNotFound() {
@@ -497,6 +807,8 @@ void initLog() {
   if (logReady) {
     Serial.printf("Log storage ready: %u of %u bytes used\n",
                   (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes());
+    // Clean up an image left behind by a reboot mid-print
+    LittleFS.remove(IMAGE_PATH);
   } else {
     Serial.println("LittleFS mount failed, prints will not be logged");
   }
@@ -664,6 +976,49 @@ void printMessage(const String& text, Layout layout) {
   advancePaper(3);
 
   Serial.println("Print done");
+}
+
+// Streams the uploaded image to the printer as a series of GS v 0 bands.
+//   GS v 0 m xL xH yL yH d1...dk
+//   m = 0: normal size. m = 3: double width and double height (Fast mode).
+//   xL/xH = bytes per row, yL/yH = rows in this band.
+void printImage() {
+  File f = LittleFS.open(IMAGE_PATH, "r");
+  if (!f) {
+    Serial.println("Image file missing");
+    return;
+  }
+
+  Serial.printf("Printing %dx%d image (%s)\n", imageWidthBytes * 8, imageHeight,
+                imageFast ? "fast" : "sharp");
+
+  resetFormat();
+
+  static uint8_t band[SHARP_WIDTH_BYTES * IMAGE_BAND_ROWS];
+  uint8_t m = imageFast ? 3 : 0;
+  int row = 0;
+
+  while (row < imageHeight) {
+    int rows = imageHeight - row;
+    if (rows > IMAGE_BAND_ROWS) rows = IMAGE_BAND_ROWS;
+    size_t n = (size_t)imageWidthBytes * rows;
+
+    if (f.read(band, n) != n) {
+      Serial.println("Image file shorter than expected");
+      break;
+    }
+
+    printer.write(0x1D); printer.write('v'); printer.write('0'); printer.write(m);
+    printer.write(imageWidthBytes & 0xFF); printer.write(imageWidthBytes >> 8);
+    printer.write(rows & 0xFF);            printer.write(rows >> 8);
+    printer.write(band, n);
+
+    row += rows;
+  }
+
+  f.close();
+  advancePaper(3);
+  Serial.println("Image done");
 }
 
 // --- Layouts ---
