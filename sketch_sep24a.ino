@@ -12,8 +12,8 @@
 #include <LittleFS.h>
 
 // Replace with your network credentials
-const char* ssid = "Lan Solo_IOT";
-const char* password = "may092015!";
+const char* ssid = "<SSID>";
+const char* password = "<PASS>";
 
 // === Web Login ===
 // The browser will prompt for these before showing the page or accepting a print.
